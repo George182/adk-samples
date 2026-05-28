@@ -46,9 +46,24 @@ jobs:
             git merge upstream/main --ff-only
             git push origin main
             echo "synced=true" >> "$GITHUB_OUTPUT"
+
+            COMMIT_COUNT=$(git rev-list --count "$LOCAL".."$UPSTREAM")
+            echo "commit_count=$COMMIT_COUNT" >> "$GITHUB_OUTPUT"
+            echo "old_sha=$(echo $LOCAL | head -c 7)" >> "$GITHUB_OUTPUT"
+            echo "new_sha=$(echo $UPSTREAM | head -c 7)" >> "$GITHUB_OUTPUT"
+
+            PYTHON_CHANGES=$(git diff --name-only "$LOCAL".."$UPSTREAM" -- 'python/' | wc -l | tr -d ' ')
+            echo "python_changes=$PYTHON_CHANGES" >> "$GITHUB_OUTPUT"
+
+            SUMMARY=$(git log --oneline "$LOCAL".."$UPSTREAM" -- 'python/' | head -10)
+            EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+            echo "python_log<<$EOF" >> "$GITHUB_OUTPUT"
+            echo "$SUMMARY" >> "$GITHUB_OUTPUT"
+            echo "$EOF" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Detect new Python agents
+        id: detect
         if: steps.sync.outputs.synced == 'true'
         run: |
           find python/agents -maxdepth 1 -mindepth 1 -type d \
@@ -56,6 +71,35 @@ jobs:
 
           NEW=$(comm -13 /tmp/agents_before.txt /tmp/agents_after.txt)
 
+          AGENT_LIST=""
+          if [ -n "$NEW" ]; then
+            COUNT=$(echo "$NEW" | wc -l | tr -d ' ')
+            echo "new_count=$COUNT" >> "$GITHUB_OUTPUT"
+            echo "has_new=true" >> "$GITHUB_OUTPUT"
+
+            while read -r agent; do
+              TITLE=""
+              if [ -f "python/agents/$agent/README.md" ]; then
+                TITLE=$(head -20 "python/agents/$agent/README.md" \
+                  | grep -m1 -E '^#' | sed 's/^#* *//')
+              fi
+              if [ -n "$TITLE" ]; then
+                AGENT_LIST="$AGENT_LIST\n• <https://github.com/google/adk-samples/tree/main/python/agents/$agent|$agent> — $TITLE"
+              else
+                AGENT_LIST="$AGENT_LIST\n• <https://github.com/google/adk-samples/tree/main/python/agents/$agent|$agent>"
+              fi
+            done <<< "$NEW"
+          else
+            echo "has_new=false" >> "$GITHUB_OUTPUT"
+            echo "new_count=0" >> "$GITHUB_OUTPUT"
+          fi
+
+          EOF=$(dd if=/dev/urandom bs=15 count=1 status=none | base64)
+          echo "agent_list<<$EOF" >> "$GITHUB_OUTPUT"
+          echo -e "$AGENT_LIST" >> "$GITHUB_OUTPUT"
+          echo "$EOF" >> "$GITHUB_OUTPUT"
+
+          # Job summary
           {
             echo "### Sync complete"
             echo ""
@@ -63,7 +107,6 @@ jobs:
             echo ""
 
             if [ -n "$NEW" ]; then
-              COUNT=$(echo "$NEW" | wc -l | tr -d ' ')
               echo "#### $COUNT new Python agent(s)"
               echo ""
               echo "$NEW" | while read -r agent; do
@@ -82,6 +125,55 @@ jobs:
               echo "No new Python agents."
             fi
           } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Notify Slack
+        if: steps.sync.outputs.synced == 'true' && env.HAS_SLACK == 'true'
+        env:
+          HAS_SLACK: ${{ secrets.SLACK_WEBHOOK_URL != '' }}
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          COMMIT_COUNT: ${{ steps.sync.outputs.commit_count }}
+          OLD_SHA: ${{ steps.sync.outputs.old_sha }}
+          NEW_SHA: ${{ steps.sync.outputs.new_sha }}
+          PYTHON_CHANGES: ${{ steps.sync.outputs.python_changes }}
+          PYTHON_LOG: ${{ steps.sync.outputs.python_log }}
+          HAS_NEW: ${{ steps.detect.outputs.has_new }}
+          NEW_COUNT: ${{ steps.detect.outputs.new_count }}
+          AGENT_LIST: ${{ steps.detect.outputs.agent_list }}
+        run: |
+          BLOCKS='[]'
+
+          # Header
+          BLOCKS=$(echo "$BLOCKS" | jq \
+            --arg text ":arrows_counterclockwise: *ADK Samples synced* — $COMMIT_COUNT new commit(s)" \
+            '. + [{"type":"header","text":{"type":"plain_text","text":"ADK Samples — upstream sync"}}]')
+
+          # Compare link + stats
+          COMPARE="https://github.com/google/adk-samples/compare/${OLD_SHA}...${NEW_SHA}"
+          SECTION="*$COMMIT_COUNT commit(s)* merged  •  *$PYTHON_CHANGES* Python file(s) changed\n<${COMPARE}|View diff on GitHub>"
+          BLOCKS=$(echo "$BLOCKS" | jq \
+            --arg text "$SECTION" \
+            '. + [{"type":"section","text":{"type":"mrkdwn","text":$text}}]')
+
+          # New agents section
+          if [ "$HAS_NEW" = "true" ]; then
+            BLOCKS=$(echo "$BLOCKS" | jq \
+              --arg text ":new: *$NEW_COUNT new Python agent(s):*${AGENT_LIST}" \
+              '. + [{"type":"section","text":{"type":"mrkdwn","text":$text}}]')
+          fi
+
+          # Recent Python commits
+          if [ -n "$PYTHON_LOG" ]; then
+            LOG_FORMATTED=$(echo "$PYTHON_LOG" | sed 's/^/• /' | head -8)
+            BLOCKS=$(echo "$BLOCKS" | jq \
+              --arg text "*Recent Python commits:*\n\`\`\`$LOG_FORMATTED\`\`\`" \
+              '. + [{"type":"section","text":{"type":"mrkdwn","text":$text}}]')
+          fi
+
+          PAYLOAD=$(jq -n --argjson blocks "$BLOCKS" '{blocks: $blocks}')
+
+          curl -sf -X POST "$SLACK_WEBHOOK_URL" \
+            -H 'Content-Type: application/json' \
+            -d "$PAYLOAD"
 
       - name: Already up to date
         if: steps.sync.outputs.synced != 'true'
