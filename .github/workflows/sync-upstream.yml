@@ -1,0 +1,88 @@
+name: Sync Fork with Upstream
+
+on:
+  schedule:
+    - cron: '0 6 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: true
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Snapshot Python agents before sync
+        run: |
+          find python/agents -maxdepth 1 -mindepth 1 -type d \
+            | sed 's|python/agents/||' | sort > /tmp/agents_before.txt
+
+      - name: Fetch and merge upstream
+        id: sync
+        run: |
+          git remote add upstream https://github.com/google/adk-samples.git || true
+          git fetch upstream main
+
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse upstream/main)
+
+          if [ "$LOCAL" = "$UPSTREAM" ]; then
+            echo "synced=false" >> "$GITHUB_OUTPUT"
+          else
+            git merge upstream/main --ff-only
+            git push origin main
+            echo "synced=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect new Python agents
+        if: steps.sync.outputs.synced == 'true'
+        run: |
+          find python/agents -maxdepth 1 -mindepth 1 -type d \
+            | sed 's|python/agents/||' | sort > /tmp/agents_after.txt
+
+          NEW=$(comm -13 /tmp/agents_before.txt /tmp/agents_after.txt)
+
+          {
+            echo "### Sync complete"
+            echo ""
+            echo "Merged \`$(git rev-parse --short upstream/main)\` from \`google/adk-samples\`."
+            echo ""
+
+            if [ -n "$NEW" ]; then
+              COUNT=$(echo "$NEW" | wc -l | tr -d ' ')
+              echo "#### $COUNT new Python agent(s)"
+              echo ""
+              echo "$NEW" | while read -r agent; do
+                TITLE=""
+                if [ -f "python/agents/$agent/README.md" ]; then
+                  TITLE=$(head -20 "python/agents/$agent/README.md" \
+                    | grep -m1 -E '^#' | sed 's/^#* *//')
+                fi
+                if [ -n "$TITLE" ]; then
+                  echo "- [\`$agent\`](https://github.com/google/adk-samples/tree/main/python/agents/$agent) — $TITLE"
+                else
+                  echo "- [\`$agent\`](https://github.com/google/adk-samples/tree/main/python/agents/$agent)"
+                fi
+              done
+            else
+              echo "No new Python agents."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Already up to date
+        if: steps.sync.outputs.synced != 'true'
+        run: echo "### Already up to date" >> "$GITHUB_STEP_SUMMARY"
